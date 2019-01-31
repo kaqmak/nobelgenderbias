@@ -1,0 +1,529 @@
+---
+title: "Nobel gender bias"
+author: Per Lunnemann
+date: 31/01/2019
+output: html_notebook
+---
+
+This document is intended as supporting material for the paper "Gender Bias in Nobel Prizes" https://arxiv.org/abs/1810.07280, with the entire code base for the calculation.
+
+```{r  package_options, include=FALSE, warning = FALSE}
+knitr::opts_chunk$set(fig.width=12, 
+                      fig.height=8, 
+                      echo=TRUE, 
+                      warning=FALSE, 
+                      message=FALSE)
+```
+```{r, include=FALSE}
+library(rstan, quietly = TRUE)
+library(ggplot2, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(ggmcmc, quietly = TRUE)
+library(purrr, quietly = TRUE)
+
+theme_Publication <- function(base_size=10L, darkTheme = FALSE) {
+  library(grid)
+  library(ggthemes)
+  txtColor <- ifelse(darkTheme, 'white', 'black')
+  lineColor <- ifelse(darkTheme, 'white', 'black')
+  backgroundColor <- ifelse(darkTheme, 'black', 'white')
+  panelBackgroundColor <- ifelse(darkTheme, "#333333", 'white')
+  theme_foundation(base_size=base_size)+
+      theme(plot.title = element_text(face = "bold",
+                                      size = rel(1.0), hjust = 0.5),
+            text = element_text(),
+            panel.background = element_rect(colour = NA, fill = panelBackgroundColor),
+            plot.background = element_rect(colour = NA,  fill = ifelse(darkTheme, 'black',NA)),
+            panel.border = element_rect(colour = ifelse(darkTheme, 'black',NA)),
+            axis.title = element_text(face = "bold",size = rel(0.9), color = txtColor),
+            axis.title.y = element_text(angle=90,vjust =2, colour = txtColor),
+            axis.title.x = element_text(vjust = -0.2, colour = txtColor),
+            axis.text = element_text(colour = txtColor), 
+            axis.line = element_line(colour = lineColor),
+            axis.ticks = element_line(colour = lineColor),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            legend.key = element_rect(colour = NA, fill = backgroundColor),
+            legend.title = element_text(size = rel(0.9), colour = txtColor),
+            legend.text = element_text(size = rel(0.9), colour = txtColor),
+            legend.background = element_rect(fill = backgroundColor),
+            legend.box.background = element_rect(fill = backgroundColor),
+            plot.margin=unit(c(2,2,2,2),"mm"),
+            strip.background=element_rect(colour=ifelse(darkTheme, "#666666", "#f0f0f0"), fill=ifelse(darkTheme, "#666666", "#f0f0f0")),
+            strip.text = element_text(face="bold", colour=txtColor)
+      )
+}
+
+scale_fill_Publication <- function(...){
+  library(scales)
+  discrete_scale("fill",
+                 "Publication",
+                 manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
+}
+
+scale_colour_Publication <- function(...){
+  library(scales)
+  discrete_scale("colour",
+                 "Publication",
+                 manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
+}
+
+saveFigs <- FALSE
+darkTheme <- FALSE
+myggsaver <- function(gg, filename, width = 5,height = 3){
+  fpath <- file.path(getwd(), 'figs', filename)
+  ggsave(gg,filename = fpath,device = 'pdf',width = width,height = height)
+}
+```
+
+
+# Loading of gender ratio data
+We load the data from The National Research Foundation that describes the US faculty members gender ratio within various scientific fields. The grouping is slightly different from the categories of Nobel prizes, so we do a little renaming and regrouping. Notably, we assume that "Social sciences" can be exchanged with the subset "Economics" and "Life Science" is exchanged for "Physiology or Medicin". 
+```{r Loading gender ratio, fig.retina = TRUE, warning = FALSE}
+allDF <- read.csv('genderDistribution.csv')
+
+ratioDF <- allDF %>% 
+  gather(key='subject', value = 'value', -Year,-gender,-position) %>% 
+  spread(key = gender, value = value)
+
+# relabel
+ratioDF <- ratioDF %>% mutate(prize = case_when(subject == 'Physical.sciences' ~ 'Physics', 
+                                                subject == "Social.sciences" ~  'Economics', 
+                                                subject == "Life.sciences" ~  'PhysMed', 
+                                                TRUE ~ as.character(NA)
+                                                )) %>%
+                                mutate(ratio = female/both)
+
+# copy physics into chemistry assuming ratio in chemistry is the same
+chemDF <- ratioDF %>% filter(prize == 'Physics') %>% mutate(prize='Chemistry')
+
+ratioDF <- full_join(ratioDF, chemDF)
+
+gg <- ratioDF %>% 
+  ggplot(aes(x=Year, y = ratio, color = position))+
+  geom_point()+geom_line()+
+  facet_wrap(subject~., scales='free_y')+
+  theme_Publication(darkTheme = darkTheme)+
+  scale_colour_Publication()
+
+if(saveFigs){
+  myggsaver(gg, 'genderRatios.pdf', width = 7, height = 4)
+}
+gg
+```
+
+
+# Load Nobel prize statistics
+
+First we load the number of laurates within each field for each year seperated into gender
+```{r}
+
+nobelW <- read.csv('femaleNobelsL.csv')
+head(nobelW)
+# put in a long format
+nobelW <- nobelW %>% gather(key=subject, value=value, -Year) %>%  
+  separate(col = c('subject'), into = c('prize','gender'), sep='_') %>% 
+  filter(gender!='all') %>% 
+  select(-gender)
+```
+
+Next we extract the total number of Nobel laurates as taken from https://www.nobelprize.org :
+```{r}
+nobelDF <- read.csv(file = 'nobelLaurates.csv', encoding = 'Latin-1', stringsAsFactors = F)
+head(nobelDF)
+```
+
+We notice that multiple names are separated by a `;`, and use that to count how many Nobel prizes were given per year per field. 
+```{r}
+nobelDF <- nobelDF %>% 
+  rowwise() %>% 
+  mutate_at( vars(-Year), 
+             .funs = function(x) if_else(x == '???' | tolower(x) == 'none',
+                                         0L, 
+                                         length(strsplit(x, split=';')[[1]])) )  %>% 
+  ungroup() %>% 
+  as.data.frame() %>% 
+  gather(key=prize, value = nbl, -Year)
+head(nobelDF)
+```
+
+
+Now combine that with the number of female laureates:
+
+```{r}
+allNobelDF <- right_join(nobelDF,nobelW) %>% 
+  rename(nbl_f=value) %>% 
+  mutate(prize = if_else(prize=="Physiology.or.Medicine" ,'PhysMed', prize))
+
+gg <- allNobelDF %>% mutate(nbl_m=nbl-nbl_f) %>% gather(key=key, value=value,nbl_m, nbl_f) %>% 
+  ggplot(aes(x=Year, y=value, fill=key))+
+  geom_bar(stat="identity")+
+  facet_grid(prize~. , scales='free_y')+ ylab('Total')+
+  scale_fill_brewer(palette = "Set1",name = 'Nobel laurates', labels=c("Female","Male"))+
+  theme_Publication(darkTheme = TRUE)
+
+if(saveFigs){
+  myggsaver(gg = gg, filename = 'nobelLaurateBarPlot.pdf')
+}
+gg
+
+```
+
+So we can now join the data containing information on the gender ratio (`ratioDF`) and data counting the nobel laureates.
+```{r}
+totDF <- right_join(allNobelDF,ratioDF, by=c('Year','prize'))
+sample_n(totDF,10)
+```
+
+We notice that most values of `nbl` and `nbl_f` are `NA` since we only have gender ratio data back untill year `r min(ratioDF$Year)`. To accomodate for this we shall do some extrapolation back in time. 
+
+# Extrapolation
+We shall extraplotate assuming a logistic function for each scientific field of the for
+$$
+f(y) = \frac{A}{1+\exp[(y-y_0)/g]}
+$$
+where $y$ is year and $y_0$ is a fit parameter such that $f(y_0) = A/2$. Finally, $g$ is a fit variable that determines the characteristic growth time. 
+```{r}
+# The function to fit
+ myFitFunction <- function(df){
+  nls(data = df, 
+      formula = ratio~A/(1+exp(-(Year-2000-y00)/g))+off, 
+      start = list(A = 0.5, g = 10, y00 = 10, off = 0.01), 
+      lower=c(0,0.1,-30,0.0), 
+      upper=c(1,20,30,0.2),
+      control = list(maxiter = 50), 
+      algorithm = 'port')
+}
+
+# The predictor function
+myPredictorWithDelay <- function(fitObj, delay){
+  year <- 1901:2018
+  y <- year-delay
+  y_i <- predict(fitObj, newdata=list(Year=y))
+  return(data.frame(Year = year, ratioEx = y_i))
+}
+
+```
+
+Once we have created the fit function we are now ready to do the extrapolation. We do this by grouping by prize and position, and subsequently fit and extrapolate.
+```{r, warning=FALSE}
+extrapolateRatio <- function(totDF, delay = 10){ #Make function that given totDF returns DF with extrapolated ratios
+  by_prize <- totDF %>% filter(!is.na(prize)) %>% group_by(prize, position) %>% nest() 
+  by_prize <- by_prize %>% mutate(model = purrr::map(.x = data,.f =  myFitFunction))
+  by_prize <- by_prize %>% mutate(ratio_ex = map(.x = model, .f = function(x) myPredictorWithDelay(x,delay=delay)))
+  ratioExDF <- unnest(by_prize,ratio_ex)
+  return(ratioExDF)
+}
+
+# plot ratio data
+ratioExDF4Plot <- extrapolateRatio(totDF, delay = 0)
+gg <- full_join(ratioExDF4Plot, ratioDF) %>% 
+  filter(position == 'senior' & !is.na(prize), prize !='Chemistry')  %>% 
+  rename(Field = prize ) %>% 
+  mutate(Field = factor(Field, levels = c('Economics','Physics','PhysMed') )) %>%
+  mutate(ratioEx = if_else(Field=='Economics' & Year < 1969, as.numeric(NA), ratioEx)) %>% # Economics prize first awarded in 1969
+  ggplot(aes(x=Year, color= Field))+
+  geom_line(aes(y=ratioEx))+
+  geom_point(aes(y=ratio))+
+  theme_Publication(darkTheme = darkTheme)+
+  scale_colour_Publication(labels = c('Economics'="Social Sciences", 'Physics'="Physical Sciences", 'PhysMed' = "Life Sciences" ), name = 'Field')+
+  ylab('Gender ratio r')
+
+if(saveFigs){
+  myggsaver(gg, filename = 'ratioVsYear.pdf')
+}
+
+gg
+```
+
+We notice that "Social Sciences" only goes back to 1969 since the economics prize was not awarded untill then.
+
+Now, finally, we can merge in the extrapolated values keeping only extrapolated values for those years we do not have data on the ratio. In this case, we fix the delay to 15, thus implying that most Nobel prize worthy achievements were on average carried out 15 years before the  prize was given. 
+```{r}
+#substitute ratio whith no data with the extrapolated ones
+ratioExDF <- extrapolateRatio(totDF, delay = 15)
+mydf <- full_join(ratioExDF, allNobelDF, intersect(colnames(ratioExDF), colnames(allNobelDF))) %>% 
+                   left_join( . , ratioDF, by = intersect(colnames(.), colnames(ratioDF))) %>% 
+  mutate(ratio = if_else(is.na(ratio), ratioEx, ratio))
+```
+
+# Setting up the data for STAN
+The last step needed is converting the data into a format suitable for STAN. 
+We would need the ratio `r`, the number of female laureates `y`, the total number of laureates `total`, and finally decide on what position to choose (senior, junior or all). In this case we choose senior
+```{r stan data}
+# generate data/matrices for STAN 
+whichPosition <- 'senior'
+
+r <- mydf %>% filter(position == whichPosition) %>%  
+  select(Year, prize, ratio) %>% 
+  spread(prize, ratio) %>% 
+  arrange(Year) %>% 
+  select(-Year) %>% 
+  as.matrix()
+rownames(r) <- sort(unique(mydf$Year))
+
+y <- mydf %>% filter(position == whichPosition) %>%  
+  select(Year, prize, nbl_f) %>% 
+  spread(prize, nbl_f) %>% 
+  arrange(Year) %>% 
+  select(-Year) %>% 
+  mutate_all(.funs = function(x) replace_na(x,0)) %>% 
+  as.matrix()
+
+total <- mydf %>% filter(position == whichPosition) %>%  
+  select(Year, prize, nbl) %>% 
+  spread(prize, nbl) %>% 
+  arrange(Year) %>% 
+  select(-Year) %>% 
+  as.matrix()
+
+N <- nrow(total)
+J <- ncol(total)
+
+musd <- 1
+alphasd <- 1
+alphasd_center <- 1
+alphasd_sigma <- 0.5
+```
+
+# Sampling assuming common $theta$
+
+
+
+# Sampling fixed delay
+
+```{r sampling, warning=FALSE, message=FALSE, results='hide'}
+fit <-
+  stan(
+    file = 'myStanFile.stan',
+    data = list(N = N,
+                J = J,
+                y = y, 
+                r=r, 
+                total = total,
+                samplePriors = FALSE,
+                musd =musd,
+                alphasd =alphasd),
+    model_name =  'posterior',
+    options(mc.cores = parallel::detectCores()),
+    control = list(stepsize=0.01, adapt_delta=0.99),
+    iter = 5000, chains = 2
+  )
+
+fitPrior <-
+  stan(
+    file = 'myStanFile.stan',
+    data = list(N = N,
+                J = J,
+                y = y, 
+                r=r, 
+                total = total,
+                samplePriors = TRUE,
+                musd =musd,
+                alphasd =alphasd),
+    model_name =  'prior',
+    options(mc.cores = parallel::detectCores()),
+    control = list(stepsize=0.01, adapt_delta=0.99),
+    iter = 5000, chains = 2
+  )
+
+```
+
+Let us have a look at the parameter $\log(\alpha)$ for the four scientific fields
+
+
+
+
+```{r, warning=FALSE, echo = FALSE}
+hm <- ggs(fit)
+hmPrior <- ggs(fitPrior)
+
+hmTot <- dplyr::bind_rows(list(Posterior=hm, Prior= hmPrior), .id = 'type') %>% 
+  mutate(type=factor(type, levels=c('Prior','Posterior'))) %>% 
+  mutate(Parameter = if_else(Parameter == 'lalpha[1]',colnames(r)[1], as.character(Parameter))) %>% 
+  mutate(Parameter = if_else(Parameter == 'lalpha[2]',colnames(r)[2], as.character(Parameter))) %>% 
+  mutate(Parameter = if_else(Parameter == 'lalpha[3]',colnames(r)[3], as.character(Parameter))) %>% 
+  mutate(Parameter = if_else(Parameter == 'lalpha[4]',colnames(r)[4], as.character(Parameter)))
+  
+hmTot <- hmTot %>%  filter(Parameter %in% colnames(r))
+
+hmPrior <- hmTot %>% filter(type == 'Prior') %>% filter(Parameter %in% colnames(r))
+hmPosterior <- hmTot %>% filter(type == 'Posterior') %>% filter(Parameter %in% colnames(r))
+gg <- hmTot %>%
+  ggplot(aes(x=value))+
+  geom_density(alpha=0.8,aes(fill=type))+
+  facet_grid(Parameter~.)+
+  theme_Publication(darkTheme = darkTheme)+
+  scale_fill_manual(values = c("slategrey", "orange2"))+
+  xlab(expression(log(alpha)))+ylab(expression(p( log(alpha)*"|"*r*","*delta)))
+
+if(saveFigs){
+  myggsaver(gg,filename = 'alphaPostvsPriorLog.pdf')
+}
+
+gg
+
+
+```
+
+```{r}
+hmPosterior %>% group_by(Parameter) %>% summarise(b = 1-sum(as.numeric(value<0))/n())
+```
+
+
+Perhaps more intuitive to see it on a linear scale plotting $\alpha$
+
+```{r, warning=FALSE, echo = FALSE}
+# Do some plotting
+hm <- ggs(fit)
+hmPrior <- ggs(fitPrior)
+
+hmTot <- dplyr::bind_rows(list(Posterior=hm, Prior= hmPrior), .id = 'type') %>% 
+  mutate(type=factor(type, levels=c('Prior','Posterior'))) %>% 
+  mutate(Parameter = if_else(Parameter == 'alpha[1]',colnames(r)[1], as.character(Parameter))) %>% 
+  mutate(Parameter = if_else(Parameter == 'alpha[2]',colnames(r)[2], as.character(Parameter))) %>% 
+  mutate(Parameter = if_else(Parameter == 'alpha[3]',colnames(r)[3], as.character(Parameter))) %>% 
+  mutate(Parameter = if_else(Parameter == 'alpha[4]',colnames(r)[4], as.character(Parameter)))
+  
+hmTot <- hmTot %>%  filter(Parameter %in% colnames(r))
+
+hmPrior <- hmTot %>% filter(type == 'Prior') %>% filter(Parameter %in% colnames(r))
+hmPosterior <- hmTot %>% filter(type == 'Posterior') %>% filter(Parameter %in% colnames(r))
+gg <- hmTot %>%
+  ggplot(aes(x=value))+
+  geom_density(alpha=0.8,aes(fill=type))+
+  xlim(0,2.5)+
+  facet_grid(Parameter~.)+
+  theme_Publication(darkTheme = darkTheme)+
+  scale_fill_manual(values = c("slategrey", "orange2"))+
+  xlab(expression(alpha))+ylab(expression(p( alpha*"|"*r*","*delta)))
+
+if(saveFigs){
+  myggsaver(gg,filename = 'alphaPostvsPrior.pdf')
+}
+
+gg
+
+```
+```{r}
+hmPosterior %>% group_by(Parameter) %>% summarise(b = 1-sum(as.numeric(value<1))/n())
+```
+
+
+# Delay dependence
+
+In order to get an idea about the dependence of the choice of the "delay", we can repeat the whole procedure above, looping of each delay. Below we try out looping over delay ranging from 0 to 20:
+
+
+```{r samplingSweep, warning = FALSE, message = FALSE, results='hide'}
+delayArray <- 0:20
+whichPosition <- 'senior'
+
+fit <- list()
+for (delay in delayArray){
+  ratioExDF <- extrapolateRatio(totDF, delay = delay)
+  # Merge it all into mydf 
+  #substitute ratio whith no data with the extrapolated ones
+  mydf <- left_join(full_join(ratioExDF, allNobelDF), ratioDF) %>% mutate(ratio = if_else(is.na(ratio), ratioEx, ratio))
+  
+  # generate data/matrices for STAN 
+  r <- mydf %>% filter(position == whichPosition) %>%  
+    select(Year, prize, ratio) %>% 
+    spread(prize, ratio) %>% 
+    arrange(Year) %>% 
+    select(-Year) %>% 
+    as.matrix()
+  rownames(r) <- sort(unique(mydf$Year))
+  
+  y <- mydf %>% filter(position == whichPosition) %>%  
+    select(Year, prize, nbl_f) %>% 
+    spread(prize, nbl_f) %>% 
+    arrange(Year) %>% 
+    select(-Year) %>% 
+    mutate_all(.funs = function(x) replace_na(x,0)) %>%
+    as.matrix()
+  
+  total <- mydf %>% filter(position == whichPosition) %>%  
+    select(Year, prize, nbl) %>% 
+    spread(prize, nbl) %>% 
+    arrange(Year) %>% 
+    select(-Year) %>% 
+    as.matrix()
+  
+  N <- nrow(total)
+  J <- ncol(total)
+  
+  musd <- 1
+  alphasd <- 1
+  alphasd_center <- 1
+  alphasd_sigma <- 0.5
+  
+  # Happy sampling 
+  fit[[as.character(delay)]] <-
+    stan(
+      file = 'myStanFile.stan',
+      data = list(N = N,
+                  J = J,
+                  y = y,
+                  r=r,
+                  total = total,
+                  samplePriors = FALSE,
+                  musd =musd,
+                  alphasd =alphasd),
+      model_name =  'example',
+      options(mc.cores = parallel::detectCores()),
+      control = list(stepsize=0.01, adapt_delta=0.99),
+      iter = 2000, chains = 2
+    )
+  
+}
+
+```
+
+We do a little bit of data massage before plotting
+```{r  sweep data prep, warning = FALSE}
+
+library(data.table)
+sweeplist <- lapply(X = fit, FUN = ggs)
+
+myMap <- list('alpha[1]' = colnames(r)[1], 'alpha[2]' = colnames(r)[2], 'alpha[3]' = colnames(r)[3], 'alpha[4]' = colnames(r)[4] )
+myDT <- data.table::rbindlist(sweeplist,idcol =  'delay')[Parameter %like% '^alpha.[0-9].$'][, Parameter:=as.character(Parameter)][, delay:=as.numeric(delay)]
+myDT[Parameter=='alpha[1]', Parameter := myMap[[1]]]
+myDT[Parameter=='alpha[2]', Parameter := myMap[[2]]]
+myDT[Parameter=='alpha[3]', Parameter := myMap[[3]]]
+myDT[Parameter=='alpha[4]', Parameter := myMap[[4]]]
+```
+
+```{r delay sweep alpha violin plot, warning = FALSE, message = FALSE}
+gg <- myDT[(delay%%2)==0,] %>% mutate(Parameter = factor(Parameter, levels = c('Economics','Physics','PhysMed','Chemistry') ))  %>% ggplot(aes(x=as.factor(delay), y=value, fill=Parameter))+
+  geom_violin(draw_quantiles = c(0.5))+
+  stat_summary(fun.y = "mean", geom = "point", shape=4, size=2, stroke = 1)+
+  facet_grid(Parameter~. )+
+  ylim(0,1)+ 
+  xlab(expression('Lag '*delta*' [years]'))+
+  ylab(expression(alpha))+
+  theme_Publication(darkTheme = darkTheme)+scale_fill_Publication()
+if(saveFigs){
+  myggsaver(gg = gg, filename = 'meanVsDelayVioling.pdf')
+}
+gg
+```
+
+Intead of plotting a probability density distribution, we could also plot the probability of women being negatively biased. E.g. $P(\alpha\geq1)=\int_0^1 p(\alpha|r,\delta)\mathrm{d}\alpha$. For visual clarity, we shall instead plot probability of women being \emph{positively} biased, .e.g $P(\alpha\geq1)=1-\int_0^1 p(\alpha|r,\delta)\mathrm{d}\alpha$. Ofcourse, we don't need to fiddle with numerical integration. Instead we just utilize our samples (confident that our sampling has converged to the true distribution), and count those smaller than one and divide with total number of samples.
+
+```{r delay sweep alpha line plot, warning = FALSE, message = FALSE}
+gg <- myDT[,.(b = 1-sum(value <= 1)/.N), by = .(Parameter, delay)] %>% 
+  as.data.frame() %>% 
+  mutate(Parameter = factor(Parameter, levels = c('Economics','Physics','PhysMed','Chemistry') )) %>%
+  ggplot(aes(y=b, x=delay, color=Parameter))+
+  geom_line()+geom_point()+
+  xlab(expression('Lag '*delta*' [years]'))+
+  ylab(expression('P('*alpha*'>1)'))+
+  theme_Publication(darkTheme = darkTheme)+scale_colour_Publication()+
+  scale_colour_Publication( name = 'Scientific field')
+
+if(saveFigs){
+  myggsaver(gg = gg, filename = 'meanVsDelay.pdf')
+}
+gg
+```
