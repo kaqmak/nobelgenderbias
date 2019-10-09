@@ -68,7 +68,7 @@ scale_colour_Publication <- function(...){
                  manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
 }
 
-saveFigs <- FALSE
+saveFigs <- TRUE
 darkTheme <- FALSE
 myggsaver <- function(gg, filename, width = 5,height = 3){
   fpath <- file.path(getwd(), 'figs', filename)
@@ -115,7 +115,7 @@ gg
 
 # Load Nobel prize statistics
 
-First we load the number of laurates within each field for each year seperated into gender
+First we load the number of laureates within each field for each year seperated into gender
 ```{r}
 
 nobelW <- read.csv('femaleNobelsL.csv')
@@ -127,7 +127,7 @@ nobelW <- nobelW %>% gather(key=subject, value=value, -Year) %>%
   select(-gender)
 ```
 
-Next we extract the total number of Nobel laurates as taken from https://www.nobelprize.org :
+Next we extract the total number of Nobel laureates as taken from https://www.nobelprize.org :
 ```{r}
 nobelDF <- read.csv(file = 'nobelLaurates.csv', encoding = 'Latin-1', stringsAsFactors = F)
 head(nobelDF)
@@ -159,8 +159,8 @@ gg <- allNobelDF %>% mutate(nbl_m=nbl-nbl_f) %>% gather(key=key, value=value,nbl
   ggplot(aes(x=Year, y=value, fill=key))+
   geom_bar(stat="identity")+
   facet_grid(prize~. , scales='free_y')+ ylab('Total')+
-  scale_fill_brewer(palette = "Set1",name = 'Nobel laurates', labels=c("Female","Male"))+
-  theme_Publication(darkTheme = TRUE)
+  scale_fill_brewer(palette = "Set1",name = 'Nobel laureates', labels=c("Female","Male"))+
+  theme_Publication(darkTheme = darkTheme)
 
 if(saveFigs){
   myggsaver(gg = gg, filename = 'nobelLaurateBarPlot.pdf')
@@ -418,7 +418,7 @@ In order to get an idea about the dependence of the choice of the "delay", we ca
 ```{r samplingSweep, warning = FALSE, message = FALSE, results='hide'}
 delayArray <- 0:20
 whichPosition <- 'senior'
-
+gc()
 fit <- list()
 for (delay in delayArray){
   ratioExDF <- extrapolateRatio(totDF, delay = delay)
@@ -473,7 +473,7 @@ for (delay in delayArray){
       model_name =  'example',
       options(mc.cores = parallel::detectCores()),
       control = list(stepsize=0.01, adapt_delta=0.99),
-      iter = 2000, chains = 2
+      iter = 4000, chains = 2
     )
   
 }
