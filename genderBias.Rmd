@@ -20,6 +20,7 @@ library(ggplot2, quietly = TRUE)
 library(dplyr, quietly = TRUE)
 library(ggmcmc, quietly = TRUE)
 library(purrr, quietly = TRUE)
+library(tibble, quietly = TRUE)
 
 theme_Publication <- function(base_size=10L, darkTheme = FALSE) {
   library(grid)
@@ -68,11 +69,12 @@ scale_colour_Publication <- function(...){
                  manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
 }
 
-saveFigs <- TRUE
+saveFigs <- FALSE
 darkTheme <- FALSE
 myggsaver <- function(gg, filename, width = 5,height = 3){
   fpath <- file.path(getwd(), 'figs', filename)
-  ggsave(gg,filename = fpath,device = 'pdf',width = width,height = height)
+  filetype <- unlist(strsplit(x = filename, split = '\\.'))[2]
+  ggsave(gg,filename = fpath,device = filetype, width = width,height = height)
 }
 ```
 
@@ -115,7 +117,7 @@ gg
 
 # Load Nobel prize statistics
 
-First we load the number of laureates within each field for each year seperated into gender
+First we load the number of laurates within each field for each year seperated into gender
 ```{r}
 
 nobelW <- read.csv('femaleNobelsL.csv')
@@ -127,7 +129,7 @@ nobelW <- nobelW %>% gather(key=subject, value=value, -Year) %>%
   select(-gender)
 ```
 
-Next we extract the total number of Nobel laureates as taken from https://www.nobelprize.org :
+Next we extract the total number of Nobel laurates as taken from https://www.nobelprize.org :
 ```{r}
 nobelDF <- read.csv(file = 'nobelLaurates.csv', encoding = 'Latin-1', stringsAsFactors = F)
 head(nobelDF)
@@ -159,8 +161,8 @@ gg <- allNobelDF %>% mutate(nbl_m=nbl-nbl_f) %>% gather(key=key, value=value,nbl
   ggplot(aes(x=Year, y=value, fill=key))+
   geom_bar(stat="identity")+
   facet_grid(prize~. , scales='free_y')+ ylab('Total')+
-  scale_fill_brewer(palette = "Set1",name = 'Nobel laureates', labels=c("Female","Male"))+
-  theme_Publication(darkTheme = darkTheme)
+  scale_fill_brewer(palette = "Set1",name = 'Nobel laurates', labels=c("Female","Male"))+
+  theme_Publication(darkTheme = TRUE)
 
 if(saveFigs){
   myggsaver(gg = gg, filename = 'nobelLaurateBarPlot.pdf')
@@ -197,7 +199,7 @@ where $y$ is year and $y_0$ is a fit parameter such that $f(y_0) = A/2$. Finally
 
 # The predictor function
 myPredictorWithDelay <- function(fitObj, delay){
-  year <- 1901:2018
+  year <- 1901:2019
   y <- year-delay
   y_i <- predict(fitObj, newdata=list(Year=y))
   return(data.frame(Year = year, ratioEx = y_i))
@@ -253,19 +255,34 @@ We would need the ratio `r`, the number of female laureates `y`, the total numbe
 ```{r stan data}
 # generate data/matrices for STAN 
 whichPosition <- 'senior'
+year <- 1901:2018
+year_test <- rep(2019)
 
 r <- mydf %>% filter(position == whichPosition) %>%  
   select(Year, prize, ratio) %>% 
   spread(prize, ratio) %>% 
   arrange(Year) %>% 
+  filter(Year %in% year) %>%
   select(-Year) %>% 
   as.matrix()
-rownames(r) <- sort(unique(mydf$Year))
+rownames(r) <- sort(unique(year))
+
+num_test_points <- 1
+r_test <- mydf %>% filter(position == whichPosition) %>%  
+  select(Year, prize, ratio) %>% 
+  spread(prize, ratio) %>% 
+  arrange(Year) %>% 
+  filter(Year %in% year_test) %>%
+  select(-Year) # %>%
+
+r_test <- r_test %>% mutate(dummy = 1L) %>% full_join(., tibble(dummy = rep(1L,num_test_points))) %>% select(-dummy) %>% as.matrix()
+
 
 y <- mydf %>% filter(position == whichPosition) %>%  
   select(Year, prize, nbl_f) %>% 
   spread(prize, nbl_f) %>% 
   arrange(Year) %>% 
+  filter(Year %in% year) %>%
   select(-Year) %>% 
   mutate_all(.funs = function(x) replace_na(x,0)) %>% 
   as.matrix()
@@ -274,11 +291,16 @@ total <- mydf %>% filter(position == whichPosition) %>%
   select(Year, prize, nbl) %>% 
   spread(prize, nbl) %>% 
   arrange(Year) %>% 
+  filter(Year %in% year) %>%
   select(-Year) %>% 
   as.matrix()
 
+total_test <- data.frame(Chemistry=3, Economics=3, Physics=3, PhysMed=3) %>% mutate(dummy = 1L) %>% full_join(., tibble(dummy = rep(1L,num_test_points))) %>% select(-dummy) %>% as.matrix()
+
 N <- nrow(total)
 J <- ncol(total)
+
+N_test <- nrow(total_test)
 
 musd <- 1
 alphasd <- 1
@@ -296,18 +318,18 @@ alphasd_sigma <- 0.5
 fit <-
   stan(
     file = 'myStanFile.stan',
-    data = list(N = N,
+    data = list(N = N, N_test = N_test,
                 J = J,
                 y = y, 
-                r=r, 
-                total = total,
+                r=r, r_test = r_test,
+                total = total, total_test = total_test,
                 samplePriors = FALSE,
                 musd =musd,
                 alphasd =alphasd),
     model_name =  'posterior',
     options(mc.cores = parallel::detectCores()),
     control = list(stepsize=0.01, adapt_delta=0.99),
-    iter = 5000, chains = 2
+    iter = 10000, chains = 2
   )
 
 fitPrior <-
@@ -329,9 +351,62 @@ fitPrior <-
 
 ```
 
+# Regarding prediction
+In the generated quantities we simulate, given the posterior value of $\alpha$, the outcome for year 2019. 
+```{r}
+hm <- rstan::extract(fit)
+test <- as_tibble(drop(hm$y_test))
+colnames(test) <- colnames(r)
+
+#generate plot
+plotDF <- test %>% 
+  dplyr::sample_n(500) %>% # reduce samples for better visual clarity 
+  tibble::rowid_to_column(var = 'sample') %>% 
+  gather(key= 'prize', value='nblFemale', -sample) %>% 
+  mutate(nblMale = 3-nblFemale) %>% 
+  gather(key = 'gender', value = 'value', c('nblFemale','nblMale'))
+
+gg <- plotDF %>% ggplot(aes(x=sample, y=value, fill=gender))+
+  geom_bar(stat="identity")+
+  facet_grid(prize~. , scales='free_y')+ ylab('Total')+
+  scale_fill_brewer(palette = "Set1",name = 'Nobel laurates', labels=c("Female","Male"))+
+  theme_Publication(darkTheme = darkTheme)
+
+if(saveFigs){
+  myggsaver(gg, filename = 'simulationBarPlot.pdf')
+}
+gg
+```
+
+```{r}
+plotDF <- test %>% tibble::rowid_to_column(var = 'sample') %>% 
+  gather(key= 'prize', value='nblFemale', -sample) %>% mutate(nblFemale = as.factor(nblFemale)) %>% group_by(prize, nblFemale) %>% summarise(value = n())
+barPlot <- plotDF %>% 
+  ggplot(aes( x='', y = value, fill=nblFemale)) + 
+  geom_bar(stat = 'identity',width=1)+facet_wrap(~prize)
+ 
+gg <- barPlot + coord_polar("y", start=0) + 
+  geom_text(aes(label = paste0(round(value*100/nrow(test)), "%")), 
+            colour='white', check_overlap  = TRUE,
+            position = position_stack(vjust = 0.5))+
+            # position = position_dodge(width = 0.0))+
+  labs(x = NULL, y = NULL, fill = NULL)+
+  theme_Publication(darkTheme = darkTheme)+
+  theme(axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank())+
+  scale_fill_brewer(type = 'div',
+                    palette = 'YlGnBu',
+                    direction = -1, 
+                    name = 'Female laurates')
+
+if(saveFigs){
+  myggsaver(gg, filename = 'simulationPieChart.png',width = 5,height = 5)
+}
+gg
+```
+
 Let us have a look at the parameter $\log(\alpha)$ for the four scientific fields
-
-
 
 
 ```{r, warning=FALSE, echo = FALSE}
@@ -418,7 +493,7 @@ In order to get an idea about the dependence of the choice of the "delay", we ca
 ```{r samplingSweep, warning = FALSE, message = FALSE, results='hide'}
 delayArray <- 0:20
 whichPosition <- 'senior'
-gc()
+
 fit <- list()
 for (delay in delayArray){
   ratioExDF <- extrapolateRatio(totDF, delay = delay)
@@ -473,7 +548,7 @@ for (delay in delayArray){
       model_name =  'example',
       options(mc.cores = parallel::detectCores()),
       control = list(stepsize=0.01, adapt_delta=0.99),
-      iter = 4000, chains = 2
+      iter = 2000, chains = 2
     )
   
 }
