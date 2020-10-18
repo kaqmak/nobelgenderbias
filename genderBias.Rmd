@@ -117,45 +117,27 @@ gg
 
 # Load Nobel prize statistics
 
-First we load the number of laurates within each field for each year seperated into gender
 ```{r}
-
-nobelW <- read.csv('femaleNobelsL.csv')
-head(nobelW)
-# put in a long format
-nobelW <- nobelW %>% gather(key=subject, value=value, -Year) %>%  
-  separate(col = c('subject'), into = c('prize','gender'), sep='_') %>% 
-  filter(gender!='all') %>% 
-  select(-gender)
+nbl_raw <- httr::content( httr::GET("http://api.nobelprize.org/2.0/laureates?format=csv&limit=20000") )
 ```
 
-Next we extract the total number of Nobel laurates as taken from https://www.nobelprize.org :
 ```{r}
-nobelDF <- read.csv(file = 'nobelLaurates.csv', encoding = 'Latin-1', stringsAsFactors = F)
-head(nobelDF)
-```
+allNobelDF <-
+  nbl_raw %>% 
+  group_by(year, gender, category) %>% 
+  summarise(value = n()) %>% 
+  filter(category %in% c('Chemistry', 'Physics','Physiology or Medicine','Economic Sciences ')) %>% 
+  pivot_wider(names_from = gender, values_from = value) %>% 
+  mutate(female = replace_na(female,0), male = replace_na(male,0)) %>% 
+  mutate(category = if_else(category == 'Physiology or Medicine', 'PhysMed',category))
+  #replace 'Physiology or Medicine' with 'PhysMed'
 
-We notice that multiple names are separated by a `;`, and use that to count how many Nobel prizes were given per year per field. 
-```{r}
-nobelDF <- nobelDF %>% 
-  rowwise() %>% 
-  mutate_at( vars(-Year), 
-             .funs = function(x) if_else(x == '???' | tolower(x) == 'none',
-                                         0L, 
-                                         length(strsplit(x, split=';')[[1]])) )  %>% 
-  ungroup() %>% 
-  as.data.frame() %>% 
-  gather(key=prize, value = nbl, -Year)
-head(nobelDF)
+head(allNobelDF)
 ```
-
 
 Now combine that with the number of female laureates:
 
 ```{r}
-allNobelDF <- right_join(nobelDF,nobelW) %>% 
-  rename(nbl_f=value) %>% 
-  mutate(prize = if_else(prize=="Physiology.or.Medicine" ,'PhysMed', prize))
 
 gg <- allNobelDF %>% mutate(nbl_m=nbl-nbl_f) %>% gather(key=key, value=value,nbl_m, nbl_f) %>% 
   ggplot(aes(x=Year, y=value, fill=key))+
