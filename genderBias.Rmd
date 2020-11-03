@@ -69,7 +69,7 @@ scale_colour_Publication <- function(...){
                  manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
 }
 
-saveFigs <- FALSE
+saveFigs <- TRUE
 darkTheme <- FALSE
 myggsaver <- function(gg, filename, width = 5,height = 3){
   fpath <- file.path(getwd(), 'figs', filename)
@@ -85,8 +85,8 @@ We load the data from The National Research Foundation that describes the US fac
 allDF <- read.csv('genderDistribution.csv')
 
 ratioDF <- allDF %>% 
-  gather(key='subject', value = 'value', -Year,-gender,-position) %>% 
-  spread(key = gender, value = value)
+  pivot_longer(cols = !all_of(c('year', 'gender', 'position')), names_to = 'subject', values_to = 'value') %>%
+  pivot_wider(names_from = 'gender', values_from = 'value')
 
 # relabel
 ratioDF <- ratioDF %>% mutate(prize = case_when(subject == 'Physical.sciences' ~ 'Physics', 
@@ -97,12 +97,14 @@ ratioDF <- ratioDF %>% mutate(prize = case_when(subject == 'Physical.sciences' ~
                                 mutate(ratio = female/both)
 
 # copy physics into chemistry assuming ratio in chemistry is the same
-chemDF <- ratioDF %>% filter(prize == 'Physics') %>% mutate(prize='Chemistry')
+chemDF <- ratioDF %>% 
+  filter(prize == 'Physics') %>% 
+  mutate(prize='Chemistry')
 
 ratioDF <- full_join(ratioDF, chemDF)
 
 gg <- ratioDF %>% 
-  ggplot(aes(x=Year, y = ratio, color = position))+
+  ggplot(aes(x=year, y = ratio, color = position))+
   geom_point()+geom_line()+
   facet_wrap(subject~., scales='free_y')+
   theme_Publication(darkTheme = darkTheme)+
@@ -122,29 +124,35 @@ nbl_raw <- httr::content( httr::GET("http://api.nobelprize.org/2.0/laureates?for
 ```
 
 ```{r}
+name_map <- c('Physiology or Medicine' = 'PhysMed', 
+              'Economic Sciences' = 'Economics',
+              Chemistry = 'Chemistry',
+              Physics = 'Physics')
 allNobelDF <-
   nbl_raw %>% 
   group_by(year, gender, category) %>% 
   summarise(value = n()) %>% 
-  filter(category %in% c('Chemistry', 'Physics','Physiology or Medicine','Economic Sciences ')) %>% 
+  filter(category %in% c('Chemistry', 'Physics','Physiology or Medicine','Economic Sciences')) %>% 
   pivot_wider(names_from = gender, values_from = value) %>% 
   mutate(female = replace_na(female,0), male = replace_na(male,0)) %>% 
-  mutate(category = if_else(category == 'Physiology or Medicine', 'PhysMed',category))
+  mutate(category = name_map[category]) %>% 
+  rename(prize = 'category', nbl_m = 'male', nbl_f = 'female') %>%
+  mutate(nbl = nbl_m+nbl_f)
   #replace 'Physiology or Medicine' with 'PhysMed'
 
 head(allNobelDF)
 ```
 
-Now combine that with the number of female laureates:
-
+Plotting this gives
 ```{r}
 
-gg <- allNobelDF %>% mutate(nbl_m=nbl-nbl_f) %>% gather(key=key, value=value,nbl_m, nbl_f) %>% 
-  ggplot(aes(x=Year, y=value, fill=key))+
+gg <- allNobelDF %>% 
+  pivot_longer(cols =  c('nbl_m', 'nbl_f'), names_to = 'key', values_to = 'value') %>%
+  ggplot(aes(x=year, y=value, fill=key))+
   geom_bar(stat="identity")+
   facet_grid(prize~. , scales='free_y')+ ylab('Total')+
   scale_fill_brewer(palette = "Set1",name = 'Nobel laurates', labels=c("Female","Male"))+
-  theme_Publication(darkTheme = TRUE)
+  theme_Publication(darkTheme = darkTheme)
 
 if(saveFigs){
   myggsaver(gg = gg, filename = 'nobelLaurateBarPlot.pdf')
@@ -155,11 +163,11 @@ gg
 
 So we can now join the data containing information on the gender ratio (`ratioDF`) and data counting the nobel laureates.
 ```{r}
-totDF <- right_join(allNobelDF,ratioDF, by=c('Year','prize'))
+totDF <- right_join(allNobelDF,ratioDF, by=c('year','prize'))
 sample_n(totDF,10)
 ```
 
-We notice that most values of `nbl` and `nbl_f` are `NA` since we only have gender ratio data back untill year `r min(ratioDF$Year)`. To accomodate for this we shall do some extrapolation back in time. 
+We notice that most values of `nbl` and `nbl_f` are `NA` since we only have gender ratio data back until year `r min(ratioDF$year)`. To accomodate for this we shall do some extrapolation back in time. 
 
 # Extrapolation
 We shall extraplotate assuming a logistic function for each scientific field of the for
@@ -171,7 +179,7 @@ where $y$ is year and $y_0$ is a fit parameter such that $f(y_0) = A/2$. Finally
 # The function to fit
  myFitFunction <- function(df){
   nls(data = df, 
-      formula = ratio~A/(1+exp(-(Year-2000-y00)/g))+off, 
+      formula = ratio~A/(1+exp(-(year-2000-y00)/g))+off, 
       start = list(A = 0.5, g = 10, y00 = 10, off = 0.01), 
       lower=c(0,0.1,-30,0.0), 
       upper=c(1,20,30,0.2),
@@ -181,17 +189,17 @@ where $y$ is year and $y_0$ is a fit parameter such that $f(y_0) = A/2$. Finally
 
 # The predictor function
 myPredictorWithDelay <- function(fitObj, delay){
-  year <- 1901:2019
+  year <- 1901:2020
   y <- year-delay
-  y_i <- predict(fitObj, newdata=list(Year=y))
-  return(data.frame(Year = year, ratioEx = y_i))
+  y_i <- predict(fitObj, newdata=list(year=y))
+  return(data.frame(year = year, ratioEx = y_i))
 }
 
 ```
 
 Once we have created the fit function we are now ready to do the extrapolation. We do this by grouping by prize and position, and subsequently fit and extrapolate.
 ```{r, warning=FALSE}
-extrapolateRatio <- function(totDF, delay = 10){ #Make function that given totDF returns DF with extrapolated ratios
+extrapolateRatio <- function(totDF, delay = 10){ #Make a function that given totDF returns DF with extrapolated ratios
   by_prize <- totDF %>% filter(!is.na(prize)) %>% group_by(prize, position) %>% nest() 
   by_prize <- by_prize %>% mutate(model = purrr::map(.x = data,.f =  myFitFunction))
   by_prize <- by_prize %>% mutate(ratio_ex = map(.x = model, .f = function(x) myPredictorWithDelay(x,delay=delay)))
@@ -205,8 +213,8 @@ gg <- full_join(ratioExDF4Plot, ratioDF) %>%
   filter(position == 'senior' & !is.na(prize), prize !='Chemistry')  %>% 
   rename(Field = prize ) %>% 
   mutate(Field = factor(Field, levels = c('Economics','Physics','PhysMed') )) %>%
-  mutate(ratioEx = if_else(Field=='Economics' & Year < 1969, as.numeric(NA), ratioEx)) %>% # Economics prize first awarded in 1969
-  ggplot(aes(x=Year, color= Field))+
+  mutate(ratioEx = if_else(Field=='Economics' & year < 1969, as.numeric(NA), ratioEx)) %>% # Economics prize first awarded in 1969
+  ggplot(aes(x=year, color= Field))+
   geom_line(aes(y=ratioEx))+
   geom_point(aes(y=ratio))+
   theme_Publication(darkTheme = darkTheme)+
@@ -214,7 +222,7 @@ gg <- full_join(ratioExDF4Plot, ratioDF) %>%
   ylab('Gender ratio r')
 
 if(saveFigs){
-  myggsaver(gg, filename = 'ratioVsYear.pdf')
+  myggsaver(gg, filename = 'ratioVsyear.pdf')
 }
 
 gg
@@ -224,11 +232,12 @@ We notice that "Social Sciences" only goes back to 1969 since the economics priz
 
 Now, finally, we can merge in the extrapolated values keeping only extrapolated values for those years we do not have data on the ratio. In this case, we fix the delay to 15, thus implying that most Nobel prize worthy achievements were on average carried out 15 years before the  prize was given. 
 ```{r}
-#substitute ratio whith no data with the extrapolated ones
+#substitute ratio with no data with the extrapolated ones
 ratioExDF <- extrapolateRatio(totDF, delay = 15)
 mydf <- full_join(ratioExDF, allNobelDF, intersect(colnames(ratioExDF), colnames(allNobelDF))) %>% 
                    left_join( . , ratioDF, by = intersect(colnames(.), colnames(ratioDF))) %>% 
-  mutate(ratio = if_else(is.na(ratio), ratioEx, ratio))
+  mutate(ratio = if_else(is.na(ratio), ratioEx, ratio)) %>% 
+  ungroup()
 ```
 
 # Setting up the data for STAN
@@ -237,47 +246,58 @@ We would need the ratio `r`, the number of female laureates `y`, the total numbe
 ```{r stan data}
 # generate data/matrices for STAN 
 whichPosition <- 'senior'
-year <- 1901:2018
-year_test <- rep(2019)
+year_train <- 1901:2019
+year_test <- c(2020)
 
-r <- mydf %>% filter(position == whichPosition) %>%  
-  select(Year, prize, ratio) %>% 
+r <- mydf %>% 
+  filter(position == whichPosition) %>%  
+  select(year, prize, ratio) %>% 
   spread(prize, ratio) %>% 
-  arrange(Year) %>% 
-  filter(Year %in% year) %>%
-  select(-Year) %>% 
+  arrange(year) %>% 
+  filter(year %in% year_train) %>%
+  select(-year) %>% 
   as.matrix()
-rownames(r) <- sort(unique(year))
+ rownames(r) <- sort(unique(year_train))
 
-num_test_points <- 1
-r_test <- mydf %>% filter(position == whichPosition) %>%  
-  select(Year, prize, ratio) %>% 
+num_test_points <- length(year_test)
+r_test <- mydf %>% 
+  filter(position == whichPosition) %>%  
+  select(year, prize, ratio) %>% 
   spread(prize, ratio) %>% 
-  arrange(Year) %>% 
-  filter(Year %in% year_test) %>%
-  select(-Year) # %>%
-
-r_test <- r_test %>% mutate(dummy = 1L) %>% full_join(., tibble(dummy = rep(1L,num_test_points))) %>% select(-dummy) %>% as.matrix()
-
-
-y <- mydf %>% filter(position == whichPosition) %>%  
-  select(Year, prize, nbl_f) %>% 
-  spread(prize, nbl_f) %>% 
-  arrange(Year) %>% 
-  filter(Year %in% year) %>%
-  select(-Year) %>% 
-  mutate_all(.funs = function(x) replace_na(x,0)) %>% 
+  arrange(year) %>% 
+  filter(year %in% year_test) %>%
+  select(-year) %>% 
+  mutate(dummy = 1L) %>% 
+  full_join(., tibble(dummy = rep(1L,num_test_points))) %>% 
+  select(!dummy) %>% 
   as.matrix()
 
-total <- mydf %>% filter(position == whichPosition) %>%  
-  select(Year, prize, nbl) %>% 
+
+y <- mydf %>% 
+  filter(position == whichPosition) %>%  
+  select(year, prize, nbl_f) %>% 
+  pivot_wider(names_from = 'prize', values_from = 'nbl_f') %>%
+  arrange(year) %>% 
+  filter(year %in% year_train) %>%
+  select(-year) %>%
+  mutate(across(everything(), function(x) replace_na(x,0))) %>%
+  as.matrix()
+
+total <- mydf %>% 
+  filter(position == whichPosition) %>%  
+  select(year, prize, nbl) %>% 
   spread(prize, nbl) %>% 
-  arrange(Year) %>% 
-  filter(Year %in% year) %>%
-  select(-Year) %>% 
+  arrange(year) %>% 
+  filter(year %in% year_train) %>%
+  select(-year) %>% 
+  mutate(across(everything(), function(x) replace_na(x,0))) %>%
   as.matrix()
 
-total_test <- data.frame(Chemistry=3, Economics=3, Physics=3, PhysMed=3) %>% mutate(dummy = 1L) %>% full_join(., tibble(dummy = rep(1L,num_test_points))) %>% select(-dummy) %>% as.matrix()
+total_test <- data.frame(Chemistry=2, Economics=2, Physics=3, PhysMed=3) %>%
+  mutate(dummy = 1L) %>% 
+  full_join(., tibble(dummy = rep(1L, num_test_points))) %>% 
+  select(!dummy) %>% 
+  as.matrix()
 
 N <- nrow(total)
 J <- ncol(total)
@@ -307,7 +327,7 @@ fit <-
                 total = total, total_test = total_test,
                 samplePriors = FALSE,
                 musd =musd,
-                alphasd =alphasd),
+                alphasd =alphasd, alphasd_center = alphasd_center, alphasd_sigma = alphasd_sigma),
     model_name =  'posterior',
     options(mc.cores = parallel::detectCores()),
     control = list(stepsize=0.01, adapt_delta=0.99),
@@ -317,14 +337,14 @@ fit <-
 fitPrior <-
   stan(
     file = 'myStanFile.stan',
-    data = list(N = N,
+    data = list(N = N, N_test = N_test,
                 J = J,
                 y = y, 
-                r=r, 
-                total = total,
+                r=r, r_test = r_test,
+                total = total, total_test = total_test,
                 samplePriors = TRUE,
                 musd =musd,
-                alphasd =alphasd),
+                alphasd =alphasd, alphasd_center = alphasd_center, alphasd_sigma = alphasd_sigma),
     model_name =  'prior',
     options(mc.cores = parallel::detectCores()),
     control = list(stepsize=0.01, adapt_delta=0.99),
@@ -340,12 +360,13 @@ hm <- rstan::extract(fit)
 test <- as_tibble(drop(hm$y_test))
 colnames(test) <- colnames(r)
 
+totalMap <- c(total_test[1,])
 #generate plot
 plotDF <- test %>% 
   dplyr::sample_n(500) %>% # reduce samples for better visual clarity 
   tibble::rowid_to_column(var = 'sample') %>% 
   gather(key= 'prize', value='nblFemale', -sample) %>% 
-  mutate(nblMale = 3-nblFemale) %>% 
+  mutate(nblMale = totalMap[prize]-nblFemale) %>% 
   gather(key = 'gender', value = 'value', c('nblFemale','nblMale'))
 
 gg <- plotDF %>% ggplot(aes(x=sample, y=value, fill=gender))+
@@ -383,7 +404,7 @@ gg <- barPlot + coord_polar("y", start=0) +
                     name = 'Female laurates')
 
 if(saveFigs){
-  myggsaver(gg, filename = 'simulationPieChart.png',width = 5,height = 5)
+  myggsaver(gg, filename = 'simulationPieChart.pdf',width = 5,height = 5)
 }
 gg
 ```
@@ -485,26 +506,26 @@ for (delay in delayArray){
   
   # generate data/matrices for STAN 
   r <- mydf %>% filter(position == whichPosition) %>%  
-    select(Year, prize, ratio) %>% 
+    select(year, prize, ratio) %>% 
     spread(prize, ratio) %>% 
-    arrange(Year) %>% 
-    select(-Year) %>% 
+    arrange(year) %>% 
+    select(-year) %>% 
     as.matrix()
-  rownames(r) <- sort(unique(mydf$Year))
+  rownames(r) <- sort(unique(mydf$year))
   
   y <- mydf %>% filter(position == whichPosition) %>%  
-    select(Year, prize, nbl_f) %>% 
+    select(year, prize, nbl_f) %>% 
     spread(prize, nbl_f) %>% 
-    arrange(Year) %>% 
-    select(-Year) %>% 
+    arrange(year) %>% 
+    select(-year) %>% 
     mutate_all(.funs = function(x) replace_na(x,0)) %>%
     as.matrix()
   
   total <- mydf %>% filter(position == whichPosition) %>%  
-    select(Year, prize, nbl) %>% 
+    select(year, prize, nbl) %>% 
     spread(prize, nbl) %>% 
-    arrange(Year) %>% 
-    select(-Year) %>% 
+    arrange(year) %>% 
+    select(-year) %>% 
     as.matrix()
   
   N <- nrow(total)

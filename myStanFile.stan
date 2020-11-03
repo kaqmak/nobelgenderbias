@@ -1,5 +1,5 @@
 data {
-  int<lower=0> N;
+  int<lower=0> N; 
   int<lower=0> N_test;
   int<lower=0> J;
   int<lower=0> y[N,J];
